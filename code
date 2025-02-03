@@ -1,0 +1,285 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+from scipy.fft import rfft, rfftfreq
+from scipy.signal import butter, filtfilt
+import time
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
+
+########################################
+# Signal Processing Functions          #
+########################################
+
+def bandpass_filter(data, lowcut, highcut, fs, order=3):
+    if fs < 8:
+        fs = 30
+    nyq = 0.5 * fs
+    if highcut >= nyq:
+        highcut = nyq * 0.99
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    y = filtfilt(b, a, data)
+    return y
+
+def estimate_heart_rate(signal, measured_fps):
+    signal = np.array(signal)
+    detrended = signal - np.mean(signal)
+    filtered = bandpass_filter(detrended, 0.8, 4.0, measured_fps, order=3)
+    N = len(filtered)
+    yf = rfft(filtered)
+    xf = rfftfreq(N, 1.0 / measured_fps)
+    # HR range: 65 BPM (~1.08 Hz) to 93 BPM (~1.55 Hz)
+    freq_range = (65/60, 93/60)
+    idxs = np.where((xf >= freq_range[0]) & (xf <= freq_range[1]))
+    xf_valid = xf[idxs]
+    yf_valid = np.abs(yf[idxs])
+    if len(yf_valid) == 0:
+        return None
+    peak_idx = np.argmax(yf_valid)
+    peak_freq = xf_valid[peak_idx]
+    hr = peak_freq * 60
+    return int(hr)
+
+########################################
+# Setup MediaPipe Face Mesh and Camera #
+########################################
+
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=5,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+mp_drawing = mp.solutions.drawing_utils
+drawing_spec = mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=1, circle_radius=1)
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 720)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 500)
+
+MIN_BUFFER_SIZE = 60    # ~2 seconds at 30 FPS
+MAX_BUFFER_SIZE = 300   # ~10 seconds
+
+face_buffers = {}  # key: face index, value: {"signal_buffer": [], "time_buffer": []}
+global_start_time = time.time()
+
+def get_forehead_roi(landmarks, frame_width, frame_height):
+    forehead_indices = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365]
+    forehead_points = []
+    for idx in forehead_indices:
+        x = int(landmarks[idx].x * frame_width)
+        y = int(landmarks[idx].y * frame_height)
+        forehead_points.append((x, y))
+    x_coords = [pt[0] for pt in forehead_points]
+    y_coords = [pt[1] for pt in forehead_points]
+    x_min = max(min(x_coords) - 10, 0)
+    x_max = min(max(x_coords) + 10, frame_width)
+    y_min = max(min(y_coords) - 10, 0)
+    y_max = min(max(y_coords) + 10, frame_height)
+    return x_min, y_min, x_max, y_max
+
+########################################
+# Helper Function to Overlay Logo      #
+########################################
+
+def overlay_logo(background, logo, x, y):
+    """
+    Overlays a logo image (with alpha channel) onto the background image at position (x, y).
+    """
+    bh, bw = background.shape[:2]
+    lh, lw = logo.shape[:2]
+    if x + lw > bw or y + lh > bh:
+        return background
+    roi = background[y:y+lh, x:x+lw]
+    logo_color = logo[:, :, :3]
+    alpha_mask = logo[:, :, 3:] / 255.0
+    blended = (1 - alpha_mask) * roi + alpha_mask * logo_color
+    background[y:y+lh, x:x+lw] = blended.astype(np.uint8)
+    return background
+
+########################################
+# Create Tkinter Root Window First     #
+########################################
+
+root = tk.Tk()
+root.title("Intelligent Heart Rate (BPM) Measurement System Using AI Techniques")
+root.configure(bg="#187BCD")  # Background color: #187BCD
+
+########################################
+# Load Images after Root Creation       #
+########################################
+
+# Load Logo for Video Overlay ("moe.png")
+logo_cv = cv2.imread("moe.png", cv2.IMREAD_UNCHANGED)
+if logo_cv is None:
+    print("Error loading logo image 'moe.png'.")
+else:
+    logo_cv = cv2.resize(logo_cv, (180, 70), interpolation=cv2.INTER_AREA)
+
+# Load Heart.gif for Left Panel
+try:
+    heart_img = Image.open("heart.gif")
+    heart_img.seek(0)  # Use the first frame if animated
+    heart_img = heart_img.convert("RGBA")
+    heart_img = heart_img.resize((100, 100), Image.Resampling.LANCZOS)
+    heart_photo = ImageTk.PhotoImage(heart_img)
+    print("heart.gif loaded successfully.")
+except Exception as e:
+    print("Error loading heart.gif:", e)
+    heart_photo = None
+
+########################################
+# Configure ttk Styles                 #
+########################################
+
+style = ttk.Style()
+style.configure("TFrame", background="#187BCD")
+style.configure("TLabel", background="#187BCD", foreground="white", font=("Helvetica", 22, "bold"))
+# Set TButton text to dark blue (#00008B)
+style.configure("TButton", font=("Helvetica", 12, "bold"), background="#187BCD", foreground="#00008B")
+
+########################################
+# Build GUI Layout                     #
+########################################
+
+# Title Frame (centered title)
+title_frame = ttk.Frame(root, padding=10)
+title_frame.pack(fill=tk.X, pady=10)
+title_label = ttk.Label(title_frame, text="Intelligent Heart Rate (BPM) Measurement System Using AI Techniques")
+title_label.grid(row=0, column=1, padx=10)
+title_frame.columnconfigure(1, weight=1)
+
+# Main Frame: left panel and right panel
+main_frame = ttk.Frame(root, padding=10)
+main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+# Left Panel: contains heart.gif and HR info, with a white border
+left_panel = tk.Frame(main_frame, bg="#187BCD", highlightbackground="white", highlightthickness=2)
+left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0,10))
+if heart_photo:
+    heart_label = tk.Label(left_panel, image=heart_photo, bg="#187BCD")
+    heart_label.image = heart_photo
+    heart_label.pack(padx=10, pady=10)
+else:
+    heart_label = tk.Label(left_panel, text="♥", bg="#187BCD", fg="white", font=("Helvetica", 48, "bold"))
+    heart_label.pack(padx=10, pady=10)
+hr_label = tk.Label(left_panel, text="HR:\nNo Data", font=("Helvetica", 16, "bold"), bg="#187BCD", fg="white", justify=tk.LEFT)
+hr_label.pack(padx=10, pady=10, anchor="n")
+
+# Right Panel: Video feed display with a border that fits the video frame
+right_panel = ttk.Frame(main_frame, padding=10)
+right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+video_border_frame = tk.Frame(right_panel, bg="white", highlightbackground="white", highlightthickness=4)
+video_border_frame.pack(fill=tk.BOTH, expand=True)
+video_label = tk.Label(video_border_frame, bg="#187BCD")
+video_label.pack(fill=tk.BOTH, expand=True)
+
+# Button Frame for additional controls
+button_frame = ttk.Frame(root, padding=10)
+button_frame.pack(fill=tk.X, pady=(0,10))
+def reset_data():
+    global face_buffers, global_start_time
+    face_buffers.clear()
+    global_start_time = time.time()
+    hr_label.config(text="HR:\nResetting data...")
+reset_button = ttk.Button(button_frame, text="Reset HR Data", command=reset_data)
+reset_button.pack(side=tk.LEFT, padx=10)
+
+# Footer Frame: Text below the reset button
+footer_text = (
+    "Student: Saud Abdul Qader Al Sheikh - Karim Musa Oglu , Supervisor: Mr. Atef Jawarneh\n"
+    "Abdullah Bin Turki Primary School for Boys\n"
+    "_______________________________________________________________________________"
+)
+footer_frame = ttk.Frame(root, padding=10)
+footer_frame.pack(fill=tk.X, pady=(0,10))
+footer_label = ttk.Label(footer_frame, text=footer_text, font=("Helvetica", 12, "bold"), background="#187BCD", foreground="white", anchor="center")
+footer_label.pack(fill=tk.X)
+
+########################################
+# Update Function for Video and HR     #
+########################################
+
+def update_frame():
+    ret, frame = cap.read()
+    if not ret:
+        root.after(10, update_frame)
+        return
+
+    frame = cv2.flip(frame, 1)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_height, frame_width, _ = frame.shape
+
+    results = face_mesh.process(frame_rgb)
+    hr_text_lines = []
+
+    if results.multi_face_landmarks:
+        for i, face_landmarks in enumerate(results.multi_face_landmarks):
+            mp_drawing.draw_landmarks(
+                image=frame,
+                landmark_list=face_landmarks,
+                connections=mp_face_mesh.FACEMESH_TESSELATION,
+                landmark_drawing_spec=drawing_spec,
+                connection_drawing_spec=drawing_spec
+            )
+            x_min, y_min, x_max, y_max = get_forehead_roi(face_landmarks.landmark, frame_width, frame_height)
+            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (255, 255, 255), 2)
+            
+            roi = frame[y_min:y_max, x_min:x_max]
+            if roi.size == 0:
+                continue
+            mean_green = np.mean(roi[:, :, 1])
+            
+            if i not in face_buffers:
+                face_buffers[i] = {"signal_buffer": [], "time_buffer": []}
+            face_buffers[i]["signal_buffer"].append(mean_green)
+            current_time = time.time() - global_start_time
+            face_buffers[i]["time_buffer"].append(current_time)
+            
+            if len(face_buffers[i]["signal_buffer"]) > MAX_BUFFER_SIZE:
+                face_buffers[i]["signal_buffer"].pop(0)
+                face_buffers[i]["time_buffer"].pop(0)
+            
+            if len(face_buffers[i]["signal_buffer"]) >= MIN_BUFFER_SIZE:
+                time_buffer = face_buffers[i]["time_buffer"]
+                measured_fps = len(time_buffer) / (time_buffer[-1] - time_buffer[0]) if (time_buffer[-1]-time_buffer[0]) > 0 else 30
+                hr = estimate_heart_rate(face_buffers[i]["signal_buffer"], measured_fps)
+                if hr:
+                    cv2.putText(frame, f'HR: {hr} BPM', (x_min, y_min - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                    hr_text_lines.append(f'Face {i+1}: {hr} BPM')
+            else:
+                cv2.putText(frame, 'Calculating HR...', (x_min, y_min - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                hr_text_lines.append(f'Face {i+1}: Calculating')
+    else:
+        face_buffers.clear()
+        hr_text_lines.append("No face detected")
+        
+    hr_label.config(text="HR:\n" + "\n".join(hr_text_lines))
+    
+    if logo_cv is not None:
+        frame = overlay_logo(frame, logo_cv, 10, 10)
+        frame = overlay_logo(frame, logo_cv, frame_width - logo_cv.shape[1] - 10, 10)
+    
+    img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    imgtk = ImageTk.PhotoImage(image=img)
+    video_label.imgtk = imgtk
+    video_label.configure(image=imgtk)
+    
+    root.after(10, update_frame)
+
+########################################
+# Start the Update Loop and Mainloop   #
+########################################
+
+update_frame()
+root.mainloop()
+
+cap.release()
+face_mesh.close()
+
